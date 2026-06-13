@@ -258,32 +258,29 @@ class NiceCloud:
 
 
 # --------------------------------------------------------------------------- #
-# NHK device socket: async TLS + signed XML protocol (commands + status + events)
+# NHK device socket: one TLS socket multiplexed across accessories.
 # --------------------------------------------------------------------------- #
-class NhkConnection:
-    """One async TLS session to the device proxy for a single accessory."""
+class NhkSession:
+    """Per-accessory NHK session state + byte-exact message building."""
 
     def __init__(self, mac: str, user: str, password: str, controller: str) -> None:
         self.mac = mac
         self.user = user
         self.password = password
         self.controller = controller
-        self._reader: asyncio.StreamReader | None = None
-        self._writer: asyncio.StreamWriter | None = None
-        self._buf = bytearray()
         self.session_id: int | None = None
         self.session_pw: bytes | None = None
         self._counter = 1
 
     # ---- framing & signing (mirror NHKParseMessage / NHKConnection) -------
-    def _next_id(self, with_session: bool = True) -> int:
+    def next_id(self, with_session: bool = True) -> int:
         c = self._counter
         self._counter += 1
         if with_session and self.session_id is not None:
             return (self.session_id & 0xFF) | (c << 8)
         return c
 
-    def _frame(self, xml: str, signed: bool) -> bytes:
+    def frame(self, xml: str, signed: bool) -> bytes:
         xml = xml.replace("\n", "\r\n")  # device expects CRLF
         if signed:
             i = xml.index("<Sign>")
@@ -292,17 +289,92 @@ class NhkConnection:
             xml = prefix + "<Sign>" + sign + "</Sign>" + xml[i + len("<Sign></Sign>"):]
         return bytes([STX]) + xml.encode() + bytes([ETX])
 
-    def _header(self, rtype: str, with_session: bool = True) -> str:
+    def header(self, rtype: str, with_session: bool = True) -> str:
         # attributes are alphabetically ordered exactly like SimpleXML's output
         return (
-            f'<Request gw="" id="{self._next_id(with_session)}" '
+            f'<Request gw="" id="{self.next_id(with_session)}" '
             f'protocolType="NHK" protocolVersion="1.0" '
             f'source="{self.controller}" target="{self.mac}" type="{rtype}">'
         )
 
-    async def _read_frame(self, timeout: float = 10.0) -> str | None:
-        """Read one STX..ETX frame from the stream, or None on timeout."""
-        assert self._reader is not None
+    def build_connect(self) -> tuple[str, bytes]:
+        """Return (cc, frame) for the unsigned CONNECT handshake."""
+        cc = "%08X" % random.getrandbits(32)
+        xml = (
+            self.header("CONNECT", with_session=False)
+            + f'\n   <Authentication cc="{cc}" username="{self.user}"/>\n</Request>'
+        )
+        return cc, self.frame(xml, signed=False)
+
+    def derive(self, sc: str, cc: str, session_id: int) -> None:
+        """Derive the session key from the CONNECT challenge response."""
+        self.session_id = session_id
+        # sessionPassword = sha256( pwd || reverse(sc) || reverse(cc) )
+        self.session_pw = _sha256(
+            bytes.fromhex(self.password),
+            bytes.fromhex(sc)[::-1],
+            bytes.fromhex(cc)[::-1],
+        )
+
+    def build_status(self) -> bytes:
+        xml = self.header("STATUS") + "\n   <Sign></Sign>\n</Request>"
+        return self.frame(xml, signed=True)
+
+    def build_change(self, action: str) -> bytes:
+        if action not in ("open", "close", "stop"):
+            raise ValueError(action)
+        body = (
+            '\n   <Devices>\n      <Devices>\n         <Device id="1">\n'
+            "            <Services>\n               <DoorAction>"
+            + action
+            + "</DoorAction>\n            </Services>\n         </Device>\n"
+            "      </Devices>\n   </Devices>"
+        )
+        xml = self.header("CHANGE") + body + "\n   <Sign></Sign>\n</Request>"
+        return self.frame(xml, signed=True)
+
+
+class NhkClient:
+    """One TLS socket to the device proxy, shared by all accessory sessions."""
+
+    def __init__(self) -> None:
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        self._buf = bytearray()
+        self._wlock = asyncio.Lock()  # serialize concurrent writers
+        self.sessions: dict[str, NhkSession] = {}
+
+    @property
+    def connected(self) -> bool:
+        return self._writer is not None
+
+    def has_session(self, mac: str) -> bool:
+        return mac in self.sessions
+
+    async def open(self) -> None:
+        """Open the shared TLS socket (no sessions yet)."""
+        self._reader, self._writer = await asyncio.wait_for(
+            asyncio.open_connection(PROXY_HOST, PROXY_PORT, ssl=_ssl_context()),
+            timeout=15,
+        )
+        self._buf.clear()
+        self.sessions.clear()
+
+    async def close(self) -> None:
+        w = self._writer
+        self._reader = self._writer = None
+        self.sessions.clear()
+        if w is not None:
+            try:
+                w.close()
+                await w.wait_closed()
+            except (OSError, asyncio.CancelledError):
+                pass
+
+    async def read_frame(self, timeout: float = 10.0) -> str | None:
+        """Read one STX..ETX frame from the shared stream, or None on timeout."""
+        if self._reader is None:
+            raise NiceApiError("socket not open")
         try:
             while True:
                 if STX in self._buf:
@@ -321,97 +393,50 @@ class NhkConnection:
         except asyncio.TimeoutError:
             return None
 
-    # ---- connection / session handshake ----------------------------------
-    async def connect(self) -> "NhkConnection":
-        self._reader, self._writer = await asyncio.wait_for(
-            asyncio.open_connection(PROXY_HOST, PROXY_PORT, ssl=_ssl_context()),
-            timeout=15,
-        )
-        cc = "%08X" % random.getrandbits(32)
-        xml = (
-            self._header("CONNECT", with_session=False)
-            + f'\n   <Authentication cc="{cc}" username="{self.user}"/>\n</Request>'
-        )
-        self._writer.write(self._frame(xml, signed=False))
-        await self._writer.drain()
+    async def _write(self, data: bytes) -> None:
+        if self._writer is None:
+            raise NiceApiError("socket not open")
+        async with self._wlock:
+            self._writer.write(data)
+            await self._writer.drain()
 
-        resp = await self._read_frame()
-        sc = _attr(resp or "", "sc")
-        if not resp or sc is None:
-            raise NiceApiError(f"NHK CONNECT failed: {resp!r}")
-        self.session_id = int(_attr(resp, "id"))
-        # sessionPassword = sha256( pwd || reverse(sc) || reverse(cc) )
-        self.session_pw = _sha256(
-            bytes.fromhex(self.password),
-            bytes.fromhex(sc)[::-1],
-            bytes.fromhex(cc)[::-1],
-        )
-        _LOGGER.debug("NHK connected to %s (session %s)", self.mac, self.session_id)
-        return self
+    async def add_session(
+        self, mac: str, user: str, password: str, controller: str
+    ) -> NhkSession:
+        """CONNECT a new accessory session over the shared socket."""
+        sess = NhkSession(mac, user, password, controller)
+        cc, frame = sess.build_connect()
+        await self._write(frame)
+        # The CONNECT reply is the only frame carrying an `sc` challenge; any
+        # interleaved pushed events from other sessions are skipped (state is
+        # re-primed via STATUS afterwards).
+        for _ in range(8):
+            resp = await self.read_frame(15)
+            if resp is None:
+                raise NiceApiError(f"NHK CONNECT timeout for {mac}")
+            sc = _attr(resp, "sc")
+            if sc is not None:
+                sess.derive(sc, cc, int(_attr(resp, "id")))
+                self.sessions[mac] = sess
+                _LOGGER.debug("NHK session up for %s (id %s)", mac, sess.session_id)
+                return sess
+        raise NiceApiError(f"no NHK CONNECT reply for {mac}")
 
-    async def close(self) -> None:
-        w = self._writer
-        self._reader = self._writer = None
-        if w is not None:
-            try:
-                w.close()
-                await w.wait_closed()
-            except (OSError, asyncio.CancelledError):
-                pass
-
-    @property
-    def connected(self) -> bool:
-        return self._writer is not None
-
-    # ---- requests --------------------------------------------------------
-    async def _send(self, rtype: str, body: str = "") -> None:
-        assert self._writer is not None
-        xml = self._header(rtype) + body + "\n   <Sign></Sign>\n</Request>"
-        self._writer.write(self._frame(xml, signed=True))
-        await self._writer.drain()
-
-    async def request_status(self) -> None:
-        """Ask the device to (re)report status; reply arrives as a frame."""
-        await self._send("STATUS")
-
-    async def status(self) -> str | None:
-        """One-shot: send STATUS and return the current DoorStatus string."""
-        await self._send("STATUS")
-        for _ in range(6):  # skip async event frames, find the STATUS reply
-            r = await self._read_frame(10)
-            if r is None:
-                break
-            statuses = parse_door_statuses(r)
-            if statuses:
-                return next(iter(statuses.values()))
+    def route(self, frame: str) -> str | None:
+        """Return the MAC of the session this frame belongs to, or None."""
+        for mac in self.sessions:
+            if mac in frame:
+                return mac
         return None
 
-    async def send_door_action(self, action: str) -> None:
-        """Write an open / close / stop command (does not read the reply).
+    async def send_status(self, mac: str) -> None:
+        sess = self.sessions.get(mac)
+        if sess is None:
+            raise NiceApiError(f"no session for {mac}")
+        await self._write(sess.build_status())
 
-        Used by the hub's listener loop, which is the sole reader of the socket;
-        the resulting state change arrives as a pushed event frame.
-        """
-        if action not in ("open", "close", "stop"):
-            raise ValueError(action)
-        body = (
-            '\n   <Devices>\n      <Devices>\n         <Device id="1">\n'
-            "            <Services>\n               <DoorAction>"
-            + action
-            + "</DoorAction>\n            </Services>\n         </Device>\n"
-            "      </Devices>\n   </Devices>"
-        )
-        await self._send("CHANGE", body)
-
-    async def door_action(self, action: str) -> None:
-        """Send open / close / stop and wait for the device's reply (one-shot use)."""
-        await self.send_door_action(action)
-        r = await self._read_frame(10)
-        if r is None:
-            raise NiceApiError("no response to CHANGE command")
-        if "<Error" in r:
-            raise NiceApiError(f"device rejected command: {r.strip()}")
-
-    async def read_event(self, timeout: float) -> str | None:
-        """Read the next frame (pushed event or reply); None on timeout."""
-        return await self._read_frame(timeout)
+    async def send_change(self, mac: str, action: str) -> None:
+        sess = self.sessions.get(mac)
+        if sess is None:
+            raise NiceApiError(f"no session for {mac}")
+        await self._write(sess.build_change(action))

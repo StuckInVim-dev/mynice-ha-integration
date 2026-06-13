@@ -2,7 +2,7 @@
   "config": {
     "step": {
       "user": {
-        "title": "Nice Garage (MyNice)",
+        "title": "MyNice",
         "description": "Sign in with your MyNice account. Your doors will be discovered automatically.",
         "data": {
           "username": "Email",
