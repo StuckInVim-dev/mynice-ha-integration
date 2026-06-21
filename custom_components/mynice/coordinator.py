@@ -58,7 +58,7 @@ class NiceHub:
         if not self._creds:
             return
         self._task = self.entry.async_create_background_task(
-            self.hass, self._run(), "nice_garage_connection"
+            self.hass, self._run(), "mynice_connection"
         )
 
     async def async_stop(self) -> None:
